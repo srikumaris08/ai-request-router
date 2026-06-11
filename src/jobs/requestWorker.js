@@ -34,6 +34,7 @@ import {
 } from '../models/index.js';
 import { QUEUE_NAMES }  from './queues.js';
 import aiService        from '../services/aiService.js';
+import { tryEmit }      from '../config/socket.js';
 
 // ── Shared audit-event writer ────────────────────────────────────────────────
 
@@ -250,6 +251,36 @@ const processJob = async (job) => {
   });
 
   await job.updateProgress(100);
+
+  // ── Step 8: Real-time Socket.io broadcast ─────────────────────────────────
+  // Emit to the global channel AND to the per-request room so dashboards and
+  // detail views both receive the update without polling.
+  const socketPayload = {
+    requestId:        request._id.toString(),
+    status:           request.status,
+    categorySnapshot: request.categorySnapshot,
+    prioritySnapshot: request.prioritySnapshot,
+    classificationId: classificationDoc._id.toString(),
+    classification: {
+      category:    classificationResult.category,
+      priority:    classificationResult.priority,
+      summary:     classificationResult.summary,
+      confidence:  classificationResult.confidence,
+      reason:      classificationResult.reason,
+      provider:    classificationResult.provider,
+      modelVersion: classificationResult.modelVersion,
+      latencyMs:   classificationResult.latencyMs,
+    },
+    resolvedAt: request.resolvedAt,
+  };
+
+  tryEmit('request:updated', socketPayload);
+
+  // Also emit to the targeted room if a client is subscribed to this request
+  try {
+    const { getIO } = await import('../config/socket.js');
+    getIO().to(`request:${request._id}`).emit('request:updated', socketPayload);
+  } catch { /* Socket.io not available in standalone mode */ }
 
   const returnValue = {
     requestId,
