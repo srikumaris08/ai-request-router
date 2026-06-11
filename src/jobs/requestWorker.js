@@ -1,45 +1,61 @@
 /**
  * @file requestWorker.js  (src/jobs)
- * @description BullMQ Worker that consumes jobs from the 'request-processing' queue.
+ * @description BullMQ Worker — consumes 'request-processing' jobs.
  *
- * Lifecycle for each job:
- *  1. Mark CustomerRequest.status → 'processing'  (with DB-level optimistic lock)
- *  2. Append a 'status_changed' event to RequestEvent collection
- *  3. [PLACEHOLDER] Execute AI classification logic
- *  4. On success  → status transitions to 'completed' (handled in classifier)
- *     On failure  → BullMQ retries per queue policy; exhausted → 'failed'
+ * Full job lifecycle:
+ *  1.  Validate job payload and load CustomerRequest from DB.
+ *  2.  Guard against double-processing (status must be 'queued').
+ *  3.  Transition status → 'processing'; write STATUS_CHANGED event.
+ *  4.  Call AIService.classify() → structured classification result.
+ *  5.  Persist AIClassification document (full rawOutput + token usage).
+ *  6.  Denormalize category/priority snapshots onto CustomerRequest.
+ *  7.  Transition status → 'completed'; write final audit events.
+ *  8.  On AI error: write AI_CLASSIFICATION_FAILED event, re-throw so
+ *      BullMQ can retry. On final attempt the worker.on('failed') handler
+ *      transitions the request to 'failed'.
  *
- * Worker is started as a standalone process by server.js so the Express event
- * loop is never blocked by heavy AI API calls.
- *
- * Expected job.data shape:
- * {
- *   requestId:       string,   // CustomerRequest._id (hex string)
- *   originalMessage: string,   // raw customer text
- *   sourceChannel:   string,   // e.g. 'email'
- * }
+ * Horizontal scaling note:
+ *   Set RUN_WORKER_STANDALONE=true and run this file as a separate process:
+ *     node src/jobs/requestWorker.js
  */
 
-import { Worker } from 'bullmq';
-import mongoose from 'mongoose';
+import { Worker }    from 'bullmq';
+import mongoose      from 'mongoose';
 
 import { redisConnection, closeRedis } from '../config/redis.js';
-import { connectDB }                  from '../config/db.js';
-import { CustomerRequest, RequestEvent, REQUEST_STATUS, EVENT_TYPES, ACTOR_TYPES } from '../models/index.js';
-import { QUEUE_NAMES }                from './queues.js';
+import { connectDB }                   from '../config/db.js';
+import {
+  CustomerRequest,
+  AIClassification,
+  RequestEvent,
+  REQUEST_STATUS,
+  EVENT_TYPES,
+  ACTOR_TYPES,
+} from '../models/index.js';
+import { QUEUE_NAMES }  from './queues.js';
+import aiService        from '../services/aiService.js';
 
-// ── Helper: append an immutable event to RequestEvent ───────────────────────
+// ── Shared audit-event writer ────────────────────────────────────────────────
+
 /**
- * Writes a single audit event. Called before and after any state mutation.
+ * Appends an immutable event to the RequestEvent collection.
+ * This is the only function allowed to create RequestEvent documents in
+ * this module — keeps the audit-append pattern centralized.
  *
  * @param {object} params
  * @param {mongoose.Types.ObjectId|string} params.requestId
- * @param {string}  params.eventType  - one of EVENT_TYPES
- * @param {*}       params.oldValue
- * @param {*}       params.newValue
+ * @param {string}  params.eventType   - one of EVENT_TYPES
+ * @param {*}       [params.oldValue]
+ * @param {*}       [params.newValue]
  * @param {object}  [params.metadata]
  */
-const appendEvent = async ({ requestId, eventType, oldValue, newValue, metadata = {} }) => {
+const appendEvent = async ({
+  requestId,
+  eventType,
+  oldValue  = null,
+  newValue  = null,
+  metadata  = {},
+}) => {
   await RequestEvent.create({
     requestId,
     eventType,
@@ -47,145 +63,253 @@ const appendEvent = async ({ requestId, eventType, oldValue, newValue, metadata 
     newValue,
     actor: {
       actorType: ACTOR_TYPES.SYSTEM,
-      label: 'request-processing-worker',
+      label:     'request-processing-worker',
     },
     metadata,
   });
 };
 
 // ── Core job processor ───────────────────────────────────────────────────────
+
 /**
- * Processes a single job from the queue.
- * BullMQ will call this function; any thrown error triggers a retry.
- *
  * @param {import('bullmq').Job} job
  */
 const processJob = async (job) => {
   const { requestId, originalMessage, sourceChannel } = job.data;
+  console.info(`[Worker] Job ${job.id} received | requestId=${requestId}`);
 
-  console.info(`[Worker] Job ${job.id} picked up | requestId=${requestId}`);
-
-  // ── Step 1: Load the CustomerRequest ────────────────────────────────────
+  // ── Step 1: Load CustomerRequest ─────────────────────────────────────────
   const request = await CustomerRequest.findById(requestId);
 
   if (!request) {
-    // Throw so BullMQ marks the job as failed immediately (no retry useful here)
-    throw new Error(`CustomerRequest not found: ${requestId}`);
+    // Non-retryable: doc doesn't exist. Throw to move job directly to failed.
+    const err = new Error(`CustomerRequest not found: ${requestId}`);
+    err.isNonRetryable = true;
+    throw err;
   }
 
-  // Guard against double-processing if the job is somehow enqueued twice
+  // ── Step 2: Double-processing guard ──────────────────────────────────────
   if (request.status !== REQUEST_STATUS.QUEUED) {
     console.warn(
       `[Worker] Job ${job.id} skipped — request ${requestId} is already '${request.status}'`
     );
-    return { skipped: true, reason: 'not_in_queued_state' };
+    return { skipped: true, reason: 'not_in_queued_state', requestId };
   }
 
-  // ── Step 2: Transition status → 'processing' ────────────────────────────
-  const previousStatus = request.status;
-
-  request.status = REQUEST_STATUS.PROCESSING;
+  // ── Step 3: status → 'processing' ────────────────────────────────────────
+  const prevStatus = request.status;
+  request.status   = REQUEST_STATUS.PROCESSING;
   await request.save();
 
-  // ── Step 3: Append status_changed event to the audit log ────────────────
   await appendEvent({
     requestId: request._id,
     eventType: EVENT_TYPES.STATUS_CHANGED,
-    oldValue:  previousStatus,
+    oldValue:  prevStatus,
     newValue:  REQUEST_STATUS.PROCESSING,
     metadata:  { jobId: job.id, attemptsMade: job.attemptsMade },
   });
 
-  console.info(`[Worker] Request ${requestId} → status: '${REQUEST_STATUS.PROCESSING}'`);
-
-  // Update BullMQ's internal job progress so dashboards can track it
   await job.updateProgress(25);
+  console.info(`[Worker] ${requestId} → '${REQUEST_STATUS.PROCESSING}'`);
 
-  // ── Step 4: AI Classification — PLACEHOLDER ─────────────────────────────
-  /**
-   * ┌─────────────────────────────────────────────────────────────────────────┐
-   * │  AI CLASSIFICATION PLACEHOLDER                                          │
-   * │─────────────────────────────────────────────────────────────────────────│
-   * │  Replace this block in Sprint 3 with the real AI service call.          │
-   * │                                                                         │
-   * │  What to implement here:                                                │
-   * │  1. Import classifierService from '../services/ai/classifier.service'   │
-   * │  2. Call:                                                               │
-   * │       const result = await classifierService.classify({                 │
-   * │         requestId: request._id,                                         │
-   * │         message:   originalMessage,                                     │
-   * │         channel:   sourceChannel,                                       │
-   * │       });                                                               │
-   * │                                                                         │
-   * │  3. The classifier service should:                                      │
-   * │       a. Call the chosen AI provider (OpenAI / Gemini / etc.)           │
-   * │       b. Persist an AIClassification document with the full rawOutput   │
-   * │       c. Return { category, priority, summary, confidence }             │
-   * │                                                                         │
-   * │  4. Denormalize the snapshot back onto CustomerRequest:                 │
-   * │       request.categorySnapshot = result.category;                       │
-   * │       request.prioritySnapshot = result.priority;                       │
-   * │       request.classificationId = result.classificationDoc._id;          │
-   * │       request.status           = REQUEST_STATUS.COMPLETED;              │
-   * │       await request.save();                                             │
-   * │                                                                         │
-   * │  5. Append the following events via appendEvent():                      │
-   * │       • AI_CLASSIFICATION_COMPLETED  (or AI_CLASSIFICATION_FAILED)      │
-   * │       • STATUS_CHANGED (processing → completed / failed)               │
-   * │       • PRIORITY_CHANGED (if prioritySnapshot changed)                  │
-   * │       • CATEGORY_CHANGED (new categorization)                           │
-   * │       • AGENT_ASSIGNED (once routing logic assigns an agent)            │
-   * │                                                                         │
-   * │  6. On AI provider error, throw the error so BullMQ retries.           │
-   * │     After exhausting retries, the 'failed' event below will fire.       │
-   * └─────────────────────────────────────────────────────────────────────────┘
-   */
+  // ── Step 4: AI Classification ─────────────────────────────────────────────
+  let classificationResult;
 
-  // Temporary: mark progress at 50% until classifier is wired in
-  await job.updateProgress(50);
+  try {
+    classificationResult = await aiService.classify({
+      requestId,
+      message: originalMessage,
+      channel: sourceChannel,
+    });
 
-  // ── Step 5: Return a result object (stored by BullMQ in job.returnvalue) ──
-  return {
-    requestId,
-    finalStatus: request.status,
-    processedAt: new Date().toISOString(),
-  };
-};
+    console.info(
+      `[Worker] AI classified ${requestId} as '${classificationResult.category}' / '${classificationResult.priority}' `
+      + `(confidence=${classificationResult.confidence}, provider=${classificationResult.provider}, `
+      + `latency=${classificationResult.latencyMs}ms)`
+    );
+  } catch (aiErr) {
+    // AI call failed — log the failure event, then re-throw so BullMQ retries.
+    console.error(`[Worker] AI classification failed for ${requestId}: ${aiErr.message}`);
 
-// ── Worker instantiation ─────────────────────────────────────────────────────
-/**
- * Creates and starts the BullMQ worker.
- * Called once from server.js after MongoDB connects.
- */
-export const startRequestWorker = () => {
-  const worker = new Worker(QUEUE_NAMES.REQUEST_PROCESSING, processJob, {
-    connection: redisConnection,
-    concurrency: parseInt(process.env.WORKER_CONCURRENCY ?? '5', 10),
-    limiter: {
-      // Global rate limit: at most 50 jobs per second to stay under AI API quotas
-      max:      50,
-      duration: 1000,
+    await appendEvent({
+      requestId: request._id,
+      eventType: EVENT_TYPES.AI_CLASSIFICATION_FAILED,
+      oldValue:  null,
+      newValue:  null,
+      metadata:  {
+        jobId:        job.id,
+        attemptsMade: job.attemptsMade,
+        errorMessage: aiErr.message,
+        provider:     aiService.providerName,
+      },
+    });
+
+    // Re-throw → BullMQ will retry per queue policy.
+    // worker.on('failed') will handle the final 'failed' status transition
+    // once all attempts are exhausted.
+    throw aiErr;
+  }
+
+  await job.updateProgress(60);
+
+  // ── Step 5: Persist AIClassification document ─────────────────────────────
+  const classificationDoc = await AIClassification.create({
+    requestId:    request._id,
+    provider:     classificationResult.provider,
+    category:     classificationResult.category,
+    priority:     classificationResult.priority,
+    summary:      classificationResult.summary,
+    confidence:   classificationResult.confidence,
+    reason:       classificationResult.reason,
+    modelVersion: classificationResult.modelVersion,
+    latencyMs:    classificationResult.latencyMs,
+    /**
+     * rawOutput stores whatever the provider returned verbatim.
+     * For the mock provider this mirrors the structured result.
+     * For real providers you'd pass the full SDK response object here.
+     */
+    rawOutput: classificationResult,
+    errorState: { isError: false },
+  });
+
+  await appendEvent({
+    requestId: request._id,
+    eventType: EVENT_TYPES.AI_CLASSIFICATION_COMPLETED,
+    oldValue:  null,
+    newValue:  {
+      classificationId: classificationDoc._id,
+      category:         classificationResult.category,
+      priority:         classificationResult.priority,
+      confidence:       classificationResult.confidence,
+    },
+    metadata: {
+      jobId:        job.id,
+      provider:     classificationResult.provider,
+      modelVersion: classificationResult.modelVersion,
+      latencyMs:    classificationResult.latencyMs,
     },
   });
 
-  // ── Worker event hooks ──────────────────────────────────────────────────
+  await job.updateProgress(75);
+
+  // ── Step 6: Denormalize snapshots onto CustomerRequest ─────────────────────
+  const prevCategory = request.categorySnapshot;
+  const prevPriority = request.prioritySnapshot;
+
+  request.categorySnapshot  = classificationResult.category;
+  request.prioritySnapshot  = classificationResult.priority;
+  request.classificationId  = classificationDoc._id;
+  request.status            = REQUEST_STATUS.COMPLETED;
+  request.resolvedAt        = new Date();
+  await request.save();
+
+  // ── Step 7: Final audit events ────────────────────────────────────────────
+
+  // Category assigned (was null before)
+  if (prevCategory !== classificationResult.category) {
+    await appendEvent({
+      requestId: request._id,
+      eventType: EVENT_TYPES.CATEGORY_CHANGED,
+      oldValue:  prevCategory,
+      newValue:  classificationResult.category,
+      metadata:  { classificationId: classificationDoc._id },
+    });
+  }
+
+  // Priority assigned (was null before)
+  if (prevPriority !== classificationResult.priority) {
+    await appendEvent({
+      requestId: request._id,
+      eventType: EVENT_TYPES.PRIORITY_CHANGED,
+      oldValue:  prevPriority,
+      newValue:  classificationResult.priority,
+      metadata:  { classificationId: classificationDoc._id },
+    });
+  }
+
+  // Final status transition
+  await appendEvent({
+    requestId: request._id,
+    eventType: EVENT_TYPES.STATUS_CHANGED,
+    oldValue:  REQUEST_STATUS.PROCESSING,
+    newValue:  REQUEST_STATUS.COMPLETED,
+    metadata:  {
+      jobId:            job.id,
+      classificationId: classificationDoc._id,
+    },
+  });
+
+  await appendEvent({
+    requestId: request._id,
+    eventType: EVENT_TYPES.REQUEST_RESOLVED,
+    metadata:  {
+      resolvedAt:       request.resolvedAt,
+      categorySnapshot: request.categorySnapshot,
+      prioritySnapshot: request.prioritySnapshot,
+    },
+  });
+
+  await job.updateProgress(100);
+
+  const returnValue = {
+    requestId,
+    classificationId: classificationDoc._id.toString(),
+    category:         classificationResult.category,
+    priority:         classificationResult.priority,
+    finalStatus:      REQUEST_STATUS.COMPLETED,
+    processedAt:      request.resolvedAt.toISOString(),
+  };
+
+  console.info(`[Worker] Job ${job.id} DONE | ${JSON.stringify(returnValue)}`);
+  return returnValue;
+};
+
+// ── Worker factory ───────────────────────────────────────────────────────────
+
+/**
+ * Creates, configures, and starts the BullMQ worker.
+ * Called once from server.js after MongoDB is connected.
+ *
+ * @returns {import('bullmq').Worker}
+ */
+export const startRequestWorker = () => {
+  const worker = new Worker(QUEUE_NAMES.REQUEST_PROCESSING, processJob, {
+    connection:  redisConnection,
+    concurrency: parseInt(process.env.WORKER_CONCURRENCY ?? '5', 10),
+    limiter: {
+      max:      50,   // max jobs per duration window
+      duration: 1000, // window in ms → effectively 50 jobs/sec
+    },
+  });
+
+  // ── Worker-level event hooks ────────────────────────────────────────────
+
   worker.on('completed', (job, result) => {
+    if (result?.skipped) {
+      console.warn(`[Worker] Job ${job.id} skipped: ${result.reason}`);
+      return;
+    }
     console.info(
-      `[Worker] Job ${job.id} COMPLETED | requestId=${job.data.requestId} | result=${JSON.stringify(result)}`
+      `[Worker] ✓ Job ${job.id} completed | `
+      + `requestId=${result?.requestId} | category=${result?.category} | priority=${result?.priority}`
     );
   });
 
   worker.on('failed', async (job, err) => {
     console.error(
-      `[Worker] Job ${job?.id} FAILED (attempt ${job?.attemptsMade}/${job?.opts?.attempts}) | ${err.message}`
+      `[Worker] ✗ Job ${job?.id} failed `
+      + `(attempt ${job?.attemptsMade}/${job?.opts?.attempts ?? 1}) | ${err.message}`
     );
 
-    // If this was the final attempt, transition request to 'failed'
-    const isLastAttempt = job?.attemptsMade >= (job?.opts?.attempts ?? 1);
+    // On final retry attempt → mark the CustomerRequest as 'failed'
+    const isLastAttempt =
+      job?.attemptsMade >= (job?.opts?.attempts ?? 1) || err?.isNonRetryable;
+
     if (isLastAttempt && job?.data?.requestId) {
       try {
+        // Use updateOne to avoid any pre-save hooks interfering
         await CustomerRequest.findByIdAndUpdate(job.data.requestId, {
-          status: REQUEST_STATUS.FAILED,
+          $set: { status: REQUEST_STATUS.FAILED },
         });
 
         await appendEvent({
@@ -197,39 +321,52 @@ export const startRequestWorker = () => {
             jobId:        job.id,
             errorMessage: err.message,
             attemptsMade: job.attemptsMade,
+            isNonRetryable: !!err.isNonRetryable,
           },
         });
 
-        console.warn(`[Worker] Request ${job.data.requestId} marked as 'failed' after all retries.`);
+        console.warn(
+          `[Worker] Request ${job.data.requestId} marked '${REQUEST_STATUS.FAILED}' after exhausted retries.`
+        );
       } catch (updateErr) {
-        console.error('[Worker] Could not update request to failed state:', updateErr.message);
+        // Log but do NOT throw — crashing the error handler would mask the original error
+        console.error(
+          '[Worker] Could not persist failed state to DB:',
+          updateErr.message
+        );
       }
     }
   });
 
-  worker.on('error',   (err) => console.error('[Worker] Worker error:', err));
-  worker.on('stalled', (jobId) => console.warn(`[Worker] Job ${jobId} stalled — will be re-queued`));
+  worker.on('error',   (err)   => console.error('[Worker] Worker-level error:', err));
+  worker.on('stalled', (jobId) => console.warn(`[Worker] Job ${jobId} stalled — BullMQ will re-queue`));
+  worker.on('progress', (job, progress) =>
+    console.debug(`[Worker] Job ${job.id} progress: ${progress}%`)
+  );
 
   console.info(
-    `[Worker] Listening on queue '${QUEUE_NAMES.REQUEST_PROCESSING}' | concurrency=${worker.opts.concurrency}`
+    `[Worker] Started — queue='${QUEUE_NAMES.REQUEST_PROCESSING}' | `
+    + `concurrency=${worker.opts.concurrency} | provider=${aiService.providerName}`
   );
 
   return worker;
 };
 
 // ── Standalone entrypoint ────────────────────────────────────────────────────
-// Allows running this file directly:  node src/jobs/requestWorker.js
-// This is useful for horizontally scaling workers as separate processes.
+// Run as a dedicated process:
+//   RUN_WORKER_STANDALONE=true node src/jobs/requestWorker.js
+
 if (process.env.RUN_WORKER_STANDALONE === 'true') {
   (async () => {
     await connectDB();
     startRequestWorker();
 
     const graceful = async (signal) => {
-      console.info(`[Worker] ${signal} — shutting down`);
+      console.info(`[Worker] ${signal} — shutting down standalone worker`);
       await closeRedis();
       process.exit(0);
     };
+
     process.on('SIGINT',  () => graceful('SIGINT'));
     process.on('SIGTERM', () => graceful('SIGTERM'));
   })();
