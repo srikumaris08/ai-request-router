@@ -332,6 +332,8 @@ npm test
 * **What we have now:** The Express API server, the BullMQ message queue, and the background AI worker currently run together inside the same Node.js environment. This is perfect for local testing and low-volume environments.
 * **The "Two More Weeks" Scale Plan:** If thousands of customers submit complex messages at the exact same second, the intensive computational work of classifying text via AI could starve the main Express server of CPU cycles, causing the live dashboard to freeze or disconnect. We would break the background worker out into its own **decoupled, horizontally scalable container (like a separate Docker service)**. This allows us to spin up 5 or 10 independent worker nodes to chew through massive queue spikes without adding a single millisecond of lag to the core admin dashboard interface.
 
+## Demo video link :
+https://drive.google.com/file/d/1jf699B7d09NWk-v16R3jJsDkn6NwqPQC/view?usp=drive_link
  
      
   
